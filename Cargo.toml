@@ -1,0 +1,9 @@
+[package]
+name = "net-speed"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }
