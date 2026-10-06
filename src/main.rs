@@ -1,107 +1,82 @@
-use futures_util::StreamExt;
+use futures_util::{future::join_all, stream::select_all, StreamExt};
 use reqwest::Client;
 use std::env;
 use std::error::Error;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-struct TestServer {
-    id: &'static str,
-    label: &'static str,
-    ping_url: &'static str,
-    download_urls: &'static [&'static str],
-    upload_url: &'static str,
-}
+mod servers;
+use servers::{TestServer, TEST_SERVERS};
 
-const HK_DOWNLOAD_URLS: [&str; 2] = [
-    "https://hkg.download.datapacket.com/100mb.bin",
-    "https://proof.ovh.net/files/100Mb.dat",
-];
-
-const SG_DOWNLOAD_URLS: [&str; 2] = [
-    "https://sgp.download.datapacket.com/100mb.bin",
-    "https://proof.ovh.net/files/100Mb.dat",
-];
-
-const TH_DOWNLOAD_URLS: [&str; 2] = [
-    "https://bkk.download.datapacket.com/100mb.bin",
-    "https://proof.ovh.net/files/100Mb.dat",
-];
-
-const SYD_DOWNLOAD_URLS: [&str; 2] = [
-    "https://syd.download.datapacket.com/100mb.bin",
-    "https://proof.ovh.net/files/100Mb.dat",
-];
-
-const JP_DOWNLOAD_URLS: [&str; 2] = [
-    "https://tyo.download.datapacket.com/100mb.bin",
-    "https://proof.ovh.net/files/100Mb.dat",
-];
-
-const DE_DOWNLOAD_URLS: [&str; 2] = [
-    "https://fra.download.datapacket.com/100mb.bin",
-    "https://proof.ovh.net/files/100Mb.dat",
-];
-
-const US_DOWNLOAD_URLS: [&str; 2] = [
-    "https://nyc.download.datapacket.com/100mb.bin",
-    "https://proof.ovh.net/files/100Mb.dat",
-];
-
-const TEST_SERVERS: [TestServer; 7] = [
-    TestServer {
-        id: "hongkong",
-        label: "Hong Kong",
-        ping_url: "https://hkg.download.datapacket.com/1mb.bin",
-        download_urls: &HK_DOWNLOAD_URLS,
-        upload_url: "https://httpbin.org/post",
-    },
-    TestServer {
-        id: "singapore",
-        label: "Singapore",
-        ping_url: "https://sgp.download.datapacket.com/1mb.bin",
-        download_urls: &SG_DOWNLOAD_URLS,
-        upload_url: "https://httpbin.org/post",
-    },
-    TestServer {
-        id: "thailand",
-        label: "Thailand",
-        ping_url: "https://bkk.download.datapacket.com/1mb.bin",
-        download_urls: &TH_DOWNLOAD_URLS,
-        upload_url: "https://httpbin.org/post",
-    },
-    TestServer {
-        id: "sydney",
-        label: "Sydney",
-        ping_url: "https://syd.download.datapacket.com/1mb.bin",
-        download_urls: &SYD_DOWNLOAD_URLS,
-        upload_url: "https://httpbin.org/post",
-    },
-    TestServer {
-        id: "japan",
-        label: "Japan",
-        ping_url: "https://tyo.download.datapacket.com/1mb.bin",
-        download_urls: &JP_DOWNLOAD_URLS,
-        upload_url: "https://httpbin.org/post",
-    },
-    TestServer {
-        id: "germany",
-        label: "Germany",
-        ping_url: "https://fra.download.datapacket.com/1mb.bin",
-        download_urls: &DE_DOWNLOAD_URLS,
-        upload_url: "https://httpbin.org/post",
-    },
-    TestServer {
-        id: "us",
-        label: "United States",
-        ping_url: "https://nyc.download.datapacket.com/1mb.bin",
-        download_urls: &US_DOWNLOAD_URLS,
-        upload_url: "https://httpbin.org/post",
-    },
-];
+const DOWNLOAD_STREAMS: usize = 4;
+const DOWNLOAD_MAX_TIME: Duration = Duration::from_secs(10);
 
 fn mbps(bytes: u64, elapsed: Duration) -> f64 {
     (bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0
+}
+
+const DEV_TARGETS: [(&str, &str); 6] = [
+    ("npm", "https://registry.npmjs.org/"),
+    ("crates.io", "https://index.crates.io/config.json"),
+    ("PyPI", "https://pypi.org/simple/"),
+    ("GitHub", "https://github.com/"),
+    ("Docker Hub", "https://registry-1.docker.io/v2/"),
+    ("ghcr.io", "https://ghcr.io/v2/"),
+];
+
+// (what, size in MB)
+const DEV_TASKS: [(&str, f64); 3] = [
+    ("npm install (~150 MB)", 150.0),
+    ("docker pull (~400 MB image)", 400.0),
+    ("git clone linux kernel (~4 GB)", 4096.0),
+];
+
+fn sparkline(samples: &[f64]) -> String {
+    let max = samples.iter().cloned().fold(0.0, f64::max);
+    if max <= 0.0 {
+        return String::new();
+    }
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    samples
+        .iter()
+        .map(|x| BARS[((x / max) * 7.0).round() as usize])
+        .collect()
+}
+
+fn fmt_duration(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("~{:.0}s", secs.max(1.0))
+    } else {
+        format!("~{}m {:02}s", (secs / 60.0) as u64, (secs % 60.0) as u64)
+    }
+}
+
+fn print_verdict(download_mbps: f64) {
+    println!("\nWhat this means for you:");
+    for (what, mb) in DEV_TASKS {
+        println!("  {what:<34} {}", fmt_duration(mb * 8.0 / download_mbps));
+    }
+    let stream = if download_mbps >= 25.0 { "✓" } else { "✗" };
+    println!("  {:<34} {stream}", "4K stream (25 Mbps)");
+}
+
+async fn profile_dev_targets(client: &Client) {
+    println!("\nDeveloper services (latency):");
+    let results = join_all(DEV_TARGETS.iter().map(|(name, url)| async move {
+        // warm-up request so the timed one excludes DNS/TLS setup
+        let _ = client.head(*url).send().await;
+        let started = Instant::now();
+        let res = client.head(*url).send().await;
+        (*name, res.map(|_| started.elapsed().as_secs_f64() * 1_000.0))
+    }))
+    .await;
+
+    for (name, res) in results {
+        match res {
+            Ok(ms) => println!("  {name:<12} {ms:>7.0} ms"),
+            Err(_) => println!("  {name:<12} unreachable"),
+        }
+    }
 }
 
 fn print_progress(label: &str, transferred: u64, total: u64, started: Instant) {
@@ -138,16 +113,26 @@ fn print_prepare_progress(label: &str, transferred: u64, total: u64) {
     let _ = io::stdout().flush();
 }
 
-async fn profile_ping_url(client: &Client, samples: usize, ping_url: &str) -> Result<f64, Box<dyn Error>> {
-    let mut total_ms = 0.0;
+/// Returns (median ms, edge colo from the `cf-ray` header, e.g. "SIN").
+async fn profile_ping_url(client: &Client, samples: usize, ping_url: &str) -> Result<(f64, Option<String>), Box<dyn Error>> {
+    // warm-up so the timed requests exclude DNS/TLS setup
+    let warmup = client.get(ping_url).send().await?.error_for_status()?;
+    let colo = warmup
+        .headers()
+        .get("cf-ray")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit('-').next())
+        .map(str::to_owned);
 
+    let mut times = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
         client.get(ping_url).send().await?.error_for_status()?;
-        total_ms += started.elapsed().as_secs_f64() * 1_000.0;
+        times.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
+    times.sort_by(f64::total_cmp);
 
-    Ok(total_ms / samples as f64)
+    Ok((times[times.len() / 2], colo))
 }
 
 fn find_server_by_id(server_id: &str) -> Option<&'static TestServer> {
@@ -176,8 +161,7 @@ fn parse_server_choice() -> Result<Option<String>, String> {
         }
 
         if arg == "-h" || arg == "--help" {
-            println!("Usage: net-speed [--server nearest|hongkong|singapore|thailand|sydney|japan|germany|us]");
-            println!("Default: --server nearest");
+            println!("{}", usage());
             std::process::exit(0);
         }
     }
@@ -185,57 +169,43 @@ fn parse_server_choice() -> Result<Option<String>, String> {
     Ok(None)
 }
 
-async fn choose_server(client: &Client, choice: Option<String>) -> Result<&'static TestServer, String> {
-    let normalized = choice.unwrap_or_else(|| String::from("nearest"));
-
-    let explicit = match normalized.as_str() {
-        "hk" => Some("hongkong"),
-        "sg" => Some("singapore"),
-        "th" => Some("thailand"),
-        "au" => Some("sydney"),
-        "jp" => Some("japan"),
-        "de" => Some("germany"),
-        "nearest" => None,
-        other => Some(other),
-    };
-
-    if let Some(server_id) = explicit {
-        return find_server_by_id(server_id)
-            .ok_or_else(|| format!("unsupported server '{server_id}'. Use nearest, hongkong, singapore, thailand, sydney, japan, germany, us"));
-    }
-
-    let mut best: Option<(&TestServer, f64)> = None;
-    for server in &TEST_SERVERS {
-        if let Ok(latency) = profile_ping_url(client, 2, server.ping_url).await {
-            match best {
-                Some((_, best_latency)) if latency >= best_latency => {}
-                _ => best = Some((server, latency)),
-            }
-        }
-    }
-
-    best.map(|(server, _)| server)
-        .ok_or_else(|| String::from("could not determine nearest server (all probes failed)"))
+fn usage() -> String {
+    let ids: Vec<_> = TEST_SERVERS.iter().map(|s| s.id).collect();
+    format!("Usage: net-speed [--server {}]", ids.join("|"))
 }
 
-async fn profile_download(client: &Client, download_urls: &[&str], target_bytes: u64) -> Result<(u64, Duration), Box<dyn Error>> {
+fn choose_server(choice: Option<String>) -> Result<&'static TestServer, String> {
+    match choice.as_deref() {
+        None | Some("nearest") => Ok(&TEST_SERVERS[0]),
+        Some(id) => find_server_by_id(id).ok_or_else(|| format!("unsupported server '{id}'")),
+    }
+}
+
+async fn profile_download(client: &Client, download_urls: &[&str], target_bytes: u64) -> Result<(u64, Duration, Vec<f64>), Box<dyn Error>> {
     let mut last_error = String::from("no download URL attempted");
 
     for url in download_urls {
-        match client.get(*url).send().await {
-            Ok(response) => {
-                let response = match response.error_for_status() {
-                    Ok(ok) => ok,
-                    Err(err) => {
-                        last_error = format!("{url}: {err}");
-                        continue;
+        // one connection can't fill a fast link, so read several streams at once
+        let responses = join_all((0..DOWNLOAD_STREAMS).map(|_| client.get(*url).send())).await;
+        match responses.into_iter().collect::<Result<Vec<_>, _>>() {
+            Ok(responses) => {
+                let mut streams = Vec::with_capacity(responses.len());
+                for response in responses {
+                    match response.error_for_status() {
+                        Ok(ok) => streams.push(ok.bytes_stream()),
+                        Err(err) => last_error = format!("{url}: {err}"),
                     }
-                };
+                }
+                if streams.len() < DOWNLOAD_STREAMS {
+                    continue;
+                }
 
-                let mut stream = response.bytes_stream();
+                let mut stream = select_all(streams);
                 let started = Instant::now();
                 let mut downloaded: u64 = 0;
                 let mut last_progress_tick = Instant::now();
+                let mut last_bytes: u64 = 0;
+                let mut samples: Vec<f64> = Vec::new();
 
                 print_progress("Downloading", downloaded, target_bytes, started);
 
@@ -246,14 +216,17 @@ async fn profile_download(client: &Client, download_urls: &[&str], target_bytes:
                         Ok(chunk) => {
                             downloaded += chunk.len() as u64;
 
-                            if last_progress_tick.elapsed() >= Duration::from_millis(200)
-                                || downloaded >= target_bytes
-                            {
+                            let tick = last_progress_tick.elapsed();
+                            if tick >= Duration::from_millis(200) || downloaded >= target_bytes {
+                                if tick >= Duration::from_millis(100) {
+                                    samples.push(mbps(downloaded - last_bytes, tick));
+                                }
+                                last_bytes = downloaded;
                                 print_progress("Downloading", downloaded, target_bytes, started);
                                 last_progress_tick = Instant::now();
                             }
 
-                            if downloaded >= target_bytes {
+                            if downloaded >= target_bytes || started.elapsed() >= DOWNLOAD_MAX_TIME {
                                 break;
                             }
                         }
@@ -272,7 +245,7 @@ async fn profile_download(client: &Client, download_urls: &[&str], target_bytes:
                 if downloaded > 0 {
                     print_progress("Downloading", downloaded, target_bytes, started);
                     println!();
-                    return Ok((downloaded, started.elapsed()));
+                    return Ok((downloaded, started.elapsed(), samples));
                 }
 
                 last_error = format!("{url}: no bytes downloaded");
@@ -328,6 +301,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
+        .user_agent(concat!("net-speed/", env!("CARGO_PKG_VERSION")))
         .build()?;
 
     println!("net-speed: internet speed profiling\n");
@@ -336,12 +310,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(choice) => choice,
         Err(err) => {
             println!("Server selection: failed ({err})");
-            println!("Usage: net-speed [--server nearest|hongkong|singapore|thailand|sydney|japan|germany|us]");
+            println!("{}", usage());
             return Ok(());
         }
     };
 
-    let server = match choose_server(&client, server_choice).await {
+    let server = match choose_server(server_choice) {
         Ok(server) => server,
         Err(err) => {
             println!("Server selection: failed ({err})");
@@ -352,12 +326,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Server:         {} ({})", server.label, server.id);
 
     match profile_ping_url(&client, 5, server.ping_url).await {
-        Ok(avg_ping_ms) => println!("Ping (avg):    {:>8.2} ms", avg_ping_ms),
-        Err(err) => println!("Ping (avg):    failed ({err})"),
+        Ok((ping_ms, colo)) => {
+            println!("Edge:           {}", colo.as_deref().unwrap_or("unknown"));
+            println!("Ping (median): {:>8.2} ms", ping_ms);
+        }
+        Err(err) => println!("Ping (median): failed ({err})"),
     }
 
-    match profile_download(&client, server.download_urls, 8 * 1024 * 1024).await {
-        Ok((bytes, elapsed)) => println!("Download:      {:>8.2} Mbps", mbps(bytes, elapsed)),
+    let mut download_mbps = None;
+    match profile_download(&client, server.download_urls, 25 * 1024 * 1024).await {
+        Ok((bytes, elapsed, samples)) => {
+            let speed = mbps(bytes, elapsed);
+            println!("Download:      {:>8.2} Mbps", speed);
+            println!("Speed graph:   {}", sparkline(&samples));
+            download_mbps = Some(speed);
+        }
         Err(err) => println!("Download:      failed ({err})"),
     }
 
@@ -365,6 +348,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok((bytes, elapsed)) => println!("Upload:        {:>8.2} Mbps", mbps(bytes, elapsed)),
         Err(err) => println!("Upload:        failed ({err})"),
     }
+
+    if let Some(speed) = download_mbps {
+        print_verdict(speed);
+    }
+    profile_dev_targets(&client).await;
 
     Ok(())
 }
