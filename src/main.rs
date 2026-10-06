@@ -1,12 +1,13 @@
-use futures_util::{future::join_all, stream::select_all, StreamExt};
-use reqwest::Client;
+use futures_util::{StreamExt, future::join_all, stream::select_all};
+use reqwest::{Client, header::HeaderMap};
 use std::env;
 use std::error::Error;
+use std::future::Future;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 mod servers;
-use servers::{TestServer, TEST_SERVERS};
+use servers::{TEST_SERVERS, TestServer};
 
 const DOWNLOAD_STREAMS: usize = 4;
 const DOWNLOAD_MAX_TIME: Duration = Duration::from_secs(10);
@@ -67,7 +68,10 @@ async fn profile_dev_targets(client: &Client) {
         let _ = client.head(*url).send().await;
         let started = Instant::now();
         let res = client.head(*url).send().await;
-        (*name, res.map(|_| started.elapsed().as_secs_f64() * 1_000.0))
+        (
+            *name,
+            res.map(|_| started.elapsed().as_secs_f64() * 1_000.0),
+        )
     }))
     .await;
 
@@ -76,6 +80,16 @@ async fn profile_dev_targets(client: &Client) {
             Ok(ms) => println!("  {name:<12} {ms:>7.0} ms"),
             Err(_) => println!("  {name:<12} unreachable"),
         }
+    }
+}
+
+fn fail_reason(err: &(dyn Error + 'static)) -> String {
+    match err
+        .downcast_ref::<reqwest::Error>()
+        .and_then(|e| e.status())
+    {
+        Some(code) => format!("status {}", code.as_u16()),
+        None => err.to_string(),
     }
 }
 
@@ -88,7 +102,7 @@ fn print_progress(label: &str, transferred: u64, total: u64, started: Instant) {
     let speed = mbps(transferred, started.elapsed());
 
     print!(
-        "\r{label}: {:>6.2}% ({:>5.2}/{:>5.2} MiB) {:>6.2} Mbps",
+        "\r\x1b[2K{label}: {:>6.2}% ({:>5.2}/{:>5.2} MiB) {:>6.2} Mbps",
         percent.min(100.0),
         transferred as f64 / (1024.0 * 1024.0),
         total as f64 / (1024.0 * 1024.0),
@@ -105,7 +119,7 @@ fn print_prepare_progress(label: &str, transferred: u64, total: u64) {
     };
 
     print!(
-        "\r{label}: {:>6.2}% ({:>5.2}/{:>5.2} MiB)",
+        "\r\x1b[2K{label}: {:>6.2}% ({:>5.2}/{:>5.2} MiB)",
         percent.min(100.0),
         transferred as f64 / (1024.0 * 1024.0),
         total as f64 / (1024.0 * 1024.0),
@@ -113,16 +127,77 @@ fn print_prepare_progress(label: &str, transferred: u64, total: u64) {
     let _ = io::stdout().flush();
 }
 
-/// Returns (median ms, edge colo from the `cf-ray` header, e.g. "SIN").
-async fn profile_ping_url(client: &Client, samples: usize, ping_url: &str) -> Result<(f64, Option<String>), Box<dyn Error>> {
-    // warm-up so the timed requests exclude DNS/TLS setup
-    let warmup = client.get(ping_url).send().await?.error_for_status()?;
-    let colo = warmup
+struct Latency {
+    min: f64,
+    median: f64,
+    p90: f64,
+    max: f64,
+    jitter: f64, // mean absolute difference between consecutive samples
+}
+
+fn latency_stats(samples: &[f64]) -> Option<Latency> {
+    if samples.is_empty() {
+        return None;
+    }
+    let jitter = if samples.len() < 2 {
+        0.0
+    } else {
+        samples.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / (samples.len() - 1) as f64
+    };
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    Some(Latency {
+        min: sorted[0],
+        median: sorted[n / 2],
+        p90: sorted[((n as f64 * 0.9).ceil() as usize).clamp(1, n) - 1],
+        max: sorted[n - 1],
+        jitter,
+    })
+}
+
+fn print_latency(label: &str, latency: Option<&Latency>) {
+    match latency {
+        Some(l) => println!(
+            "{label:<15}{:>8.2} ms  (min {:.1} / p90 {:.1} / max {:.1}, jitter {:.1})",
+            l.median, l.min, l.p90, l.max, l.jitter
+        ),
+        None => println!("{label:<15}n/a"),
+    }
+}
+
+/// Connection details Cloudflare puts on every `__down` response; missing ones are skipped.
+fn print_connection(headers: &HeaderMap) {
+    let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
+    if let Some(ip) = get("cf-meta-ip") {
+        println!("Your IP:        {ip}");
+    }
+    if let Some(asn) = get("asn") {
+        println!("Network:        AS{asn}");
+    }
+    let place: Vec<_> = [get("city"), get("country")]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !place.is_empty() {
+        println!("Location:       {}", place.join(", "));
+    }
+    println!("Edge:           {}", get("colo").unwrap_or("unknown"));
+}
+
+/// One warm-up GET (excluded from stats), then `samples` timed GETs.
+async fn profile_ping_url(
+    client: &Client,
+    samples: usize,
+    ping_url: &str,
+) -> Result<(Latency, HeaderMap), Box<dyn Error>> {
+    let headers = client
+        .get(ping_url)
+        .send()
+        .await?
+        .error_for_status()?
         .headers()
-        .get("cf-ray")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit('-').next())
-        .map(str::to_owned);
+        .clone();
 
     let mut times = Vec::with_capacity(samples);
     for _ in 0..samples {
@@ -130,15 +205,46 @@ async fn profile_ping_url(client: &Client, samples: usize, ping_url: &str) -> Re
         client.get(ping_url).send().await?.error_for_status()?;
         times.push(started.elapsed().as_secs_f64() * 1_000.0);
     }
-    times.sort_by(f64::total_cmp);
 
-    Ok((times[times.len() / 2], colo))
+    Ok((latency_stats(&times).ok_or("no ping samples")?, headers))
+}
+
+async fn probe_loop(client: &Client, ping_url: &str, times: &mut Vec<f64>) {
+    let mut warm = false; // first probe may pay for a new connection, so drop it
+    loop {
+        let started = Instant::now();
+        if client
+            .get(ping_url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .is_ok()
+        {
+            if warm {
+                times.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+            warm = true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Runs `work` while pinging in the background; returns its output and the latency seen under load.
+async fn with_loaded_latency<T>(
+    client: &Client,
+    ping_url: &str,
+    work: impl Future<Output = T>,
+) -> (T, Option<Latency>) {
+    let mut times = Vec::new();
+    let out = tokio::select! {
+        out = work => out,
+        _ = probe_loop(client, ping_url, &mut times) => unreachable!(),
+    };
+    (out, latency_stats(&times))
 }
 
 fn find_server_by_id(server_id: &str) -> Option<&'static TestServer> {
-    TEST_SERVERS
-        .iter()
-        .find(|server| server.id == server_id)
+    TEST_SERVERS.iter().find(|server| server.id == server_id)
 }
 
 fn parse_server_choice() -> Result<Option<String>, String> {
@@ -181,7 +287,11 @@ fn choose_server(choice: Option<String>) -> Result<&'static TestServer, String> 
     }
 }
 
-async fn profile_download(client: &Client, download_urls: &[&str], target_bytes: u64) -> Result<(u64, Duration, Vec<f64>), Box<dyn Error>> {
+async fn profile_download(
+    client: &Client,
+    download_urls: &[&str],
+    target_bytes: u64,
+) -> Result<(u64, Duration, Vec<f64>), Box<dyn Error>> {
     let mut last_error = String::from("no download URL attempted");
 
     for url in download_urls {
@@ -193,7 +303,7 @@ async fn profile_download(client: &Client, download_urls: &[&str], target_bytes:
                 for response in responses {
                     match response.error_for_status() {
                         Ok(ok) => streams.push(ok.bytes_stream()),
-                        Err(err) => last_error = format!("{url}: {err}"),
+                        Err(err) => last_error = fail_reason(&err),
                     }
                 }
                 if streams.len() < DOWNLOAD_STREAMS {
@@ -226,12 +336,13 @@ async fn profile_download(client: &Client, download_urls: &[&str], target_bytes:
                                 last_progress_tick = Instant::now();
                             }
 
-                            if downloaded >= target_bytes || started.elapsed() >= DOWNLOAD_MAX_TIME {
+                            if downloaded >= target_bytes || started.elapsed() >= DOWNLOAD_MAX_TIME
+                            {
                                 break;
                             }
                         }
                         Err(err) => {
-                            last_error = format!("{url}: {err}");
+                            last_error = fail_reason(&err);
                             stream_failed = true;
                             break;
                         }
@@ -243,15 +354,13 @@ async fn profile_download(client: &Client, download_urls: &[&str], target_bytes:
                 }
 
                 if downloaded > 0 {
-                    print_progress("Downloading", downloaded, target_bytes, started);
-                    println!();
                     return Ok((downloaded, started.elapsed(), samples));
                 }
 
-                last_error = format!("{url}: no bytes downloaded");
+                last_error = String::from("no bytes downloaded");
             }
             Err(err) => {
-                last_error = format!("{url}: {err}");
+                last_error = fail_reason(&err);
             }
         }
     }
@@ -259,7 +368,11 @@ async fn profile_download(client: &Client, download_urls: &[&str], target_bytes:
     Err(last_error.into())
 }
 
-async fn profile_upload(client: &Client, upload_url: &str, upload_bytes: usize) -> Result<(u64, Duration), Box<dyn Error>> {
+async fn profile_upload(
+    client: &Client,
+    upload_url: &str,
+    upload_bytes: usize,
+) -> Result<(u64, Duration), Box<dyn Error>> {
     let chunk_size = 64 * 1024;
     let chunk = vec![0_u8; chunk_size];
     let mut payload = Vec::with_capacity(upload_bytes);
@@ -280,8 +393,8 @@ async fn profile_upload(client: &Client, upload_url: &str, upload_bytes: usize) 
         }
     }
 
-    println!();
-    println!("Uploading request...");
+    print!("\r\x1b[2KUploading request...");
+    let _ = io::stdout().flush();
     let started = Instant::now();
 
     client
@@ -323,30 +436,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    println!("Server:         {} ({})", server.label, server.id);
+    let ping = profile_ping_url(&client, 10, server.ping_url).await;
+    let (download, loaded_down) = with_loaded_latency(
+        &client,
+        server.ping_url,
+        profile_download(&client, server.download_urls, 25 * 1024 * 1024),
+    )
+    .await;
+    let (upload, loaded_up) = with_loaded_latency(
+        &client,
+        server.ping_url,
+        profile_upload(&client, server.upload_url, 2 * 1024 * 1024),
+    )
+    .await;
+    print!("\r\x1b[2K"); // erase the last progress line
 
-    match profile_ping_url(&client, 5, server.ping_url).await {
-        Ok((ping_ms, colo)) => {
-            println!("Edge:           {}", colo.as_deref().unwrap_or("unknown"));
-            println!("Ping (median): {:>8.2} ms", ping_ms);
-        }
-        Err(err) => println!("Ping (median): failed ({err})"),
+    println!("Server:         {} ({})", server.label, server.id);
+    if let Ok((_, headers)) = &ping {
+        print_connection(headers);
+    }
+
+    println!();
+    match &ping {
+        Ok((latency, _)) => print_latency("Ping (median):", Some(latency)),
+        Err(err) => println!("Ping (median): failed ({})", fail_reason(err.as_ref())),
     }
 
     let mut download_mbps = None;
-    match profile_download(&client, server.download_urls, 25 * 1024 * 1024).await {
+    match &download {
         Ok((bytes, elapsed, samples)) => {
-            let speed = mbps(bytes, elapsed);
+            let speed = mbps(*bytes, *elapsed);
             println!("Download:      {:>8.2} Mbps", speed);
-            println!("Speed graph:   {}", sparkline(&samples));
+            print_latency("Loaded (down):", loaded_down.as_ref());
+            println!("Speed graph:   {}", sparkline(samples));
             download_mbps = Some(speed);
         }
-        Err(err) => println!("Download:      failed ({err})"),
+        Err(err) => println!("Download:      failed ({})", fail_reason(err.as_ref())),
     }
 
-    match profile_upload(&client, server.upload_url, 2 * 1024 * 1024).await {
-        Ok((bytes, elapsed)) => println!("Upload:        {:>8.2} Mbps", mbps(bytes, elapsed)),
-        Err(err) => println!("Upload:        failed ({err})"),
+    match &upload {
+        Ok((bytes, elapsed)) => {
+            println!("Upload:        {:>8.2} Mbps", mbps(*bytes, *elapsed));
+            print_latency("Loaded (up):", loaded_up.as_ref());
+        }
+        Err(err) => println!("Upload:        failed ({})", fail_reason(err.as_ref())),
     }
 
     if let Some(speed) = download_mbps {

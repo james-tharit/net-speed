@@ -12,6 +12,7 @@ pub static TEST_SERVERS: &[TestServer] = &[TestServer {
     id: "cloudflare",
     label: "Cloudflare (nearest edge)",
     ping_url: "https://speed.cloudflare.com/__down?bytes=0",
-    download_urls: &["https://speed.cloudflare.com/__down?bytes=26214400"],
+    // Cloudflare answers 429 (Retry-After ~50 min) to requests of >= 10 MB per IP, so stay under it.
+    download_urls: &["https://speed.cloudflare.com/__down?bytes=9000000"],
     upload_url: "https://speed.cloudflare.com/__up",
 }];
